@@ -45,6 +45,10 @@ class Episode:
     left_actions: ArrayLike = field(default_factory=list)
     left_observation_timestamps: ArrayLike = field(default_factory=list)
     left_observations: ArrayLike = field(default_factory=list)
+    elevation_action_timestamps: ArrayLike = field(default_factory=list)
+    elevation_actions: ArrayLike = field(default_factory=list)
+    elevation_observation_timestamps: ArrayLike = field(default_factory=list)
+    elevation_observations: ArrayLike = field(default_factory=list)
 
 
 class EpisodeWriter:
@@ -77,8 +81,8 @@ class EpisodeWriter:
                 self._episode.right_actions,
             )
         if self._episode.right_observations:
-            self._write_positions(
-                self._base_directory / "obs" / "arms" / "right" / "qpos.parquet",
+            self._write_observations(
+                self._base_directory / "obs" / "arms" / "right",
                 self._episode.right_observation_timestamps,
                 self._episode.right_observations,
             )
@@ -89,10 +93,26 @@ class EpisodeWriter:
                 self._episode.left_actions,
             )
         if self._episode.left_observations:
-            self._write_positions(
-                self._base_directory / "obs" / "arms" / "left" / "qpos.parquet",
+            self._write_observations(
+                self._base_directory / "obs" / "arms" / "left",
                 self._episode.left_observation_timestamps,
                 self._episode.left_observations,
+            )
+        if self._episode.elevation_actions:
+            self._write_positions(
+                self._base_directory
+                / "action"
+                / "torso"
+                / "lift"
+                / "elevation.parquet",
+                self._episode.elevation_action_timestamps,
+                self._episode.elevation_actions,
+            )
+        if self._episode.elevation_observations:
+            self._write_positions(
+                self._base_directory / "obs" / "torso" / "lift" / "elevation.parquet",
+                self._episode.elevation_observation_timestamps,
+                self._episode.elevation_observations,
             )
 
     def cancel(self):
@@ -109,6 +129,30 @@ class EpisodeWriter:
             }
         )
         pq.write_table(table, output_path)
+
+    def _write_states(self, output_path, timestamps, states):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        list_type = pa.list_(pa.float32())
+        table = pa.table(
+            {
+                "timestamp": pa.array(timestamps, type=pa.timestamp("ns")),
+                "qpos": pa.array([s.field("qpos") for s in states], type=list_type),
+                "qvel": pa.array([s.field("qvel") for s in states], type=list_type),
+                "qtorque": pa.array(
+                    [s.field("qtorque") for s in states], type=list_type
+                ),
+            }
+        )
+        pq.write_table(table, output_path)
+
+    def _write_observations(self, base_path, timestamps, observations):
+        first = observations[0]
+        if isinstance(first, pa.StructArray):
+            output_path = base_path / "state.parquet"
+            self._write_states(output_path, timestamps, observations)
+        else:
+            output_path = base_path / "qpos.parquet"
+            self._write_positions(output_path, timestamps, observations)
 
 
 class DatasetWriter:
@@ -166,7 +210,11 @@ class FrequencyDetector:
             if config["id"] != node_id:
                 continue
             inputs = config["inputs"]
-            next_input = inputs.get("tick", inputs.get("request_position"))
+            next_input = (
+                inputs.get("tick")
+                or inputs.get("request_state")
+                or inputs.get("request_position")
+            )
             if next_input is None:
                 continue
             if next_input.startswith("dora/timer/"):
@@ -310,22 +358,26 @@ def main():
             timestamp = math.ceil(timestamp.timestamp() * 1_000_000_000)
         if event_id.startswith("arm_"):
             value = event["value"]
-            if isinstance(value, pa.StructArray):
-                position = value.field("new_position")
-            else:
-                position = value
+            if isinstance(value, pa.StructArray) and "new_position" in value.type.names:
+                value = value.field("new_position")
 
             # arm_right_action ->
             # right_action
             key_prefix = event_id.removeprefix("arm_")
             # right_action ->
             # right_actions
-            positions_key = f"{key_prefix}s"
-            getattr(episode, positions_key).append(position)
+            values_key = f"{key_prefix}s"
+            getattr(episode, values_key).append(value)
             # right_action ->
             # right_action_timestamps
             timestamps_key = f"{key_prefix}_timestamps"
             getattr(episode, timestamps_key).append(timestamp)
+        elif event_id.startswith("elevation_"):
+            # elevation_observation -> elevation_observations, elevation_observation_timestamps
+            # elevation_action -> elevation_actions, elevation_action_timestamps
+            key = event_id.removeprefix("elevation_")
+            getattr(episode, f"elevation_{key}s").append(event["value"])
+            getattr(episode, f"elevation_{key}_timestamps").append(timestamp)
         elif event_id.startswith("camera_"):
             name = event_id.removeprefix("camera_")
             image = event["value"]
